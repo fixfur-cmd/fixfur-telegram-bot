@@ -5,21 +5,19 @@ import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from flask import Flask
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message
+from aiogram.enums import ParseMode
 
-# -------- ENV --------
+from flask import Flask
+from hypercorn.asyncio import serve
+from hypercorn.config import Config
+
+# ---------- ENV ----------
 load_dotenv()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", "10000"))
 
 if not TG_TOKEN:
@@ -27,69 +25,62 @@ if not TG_TOKEN:
 if not OPENAI_KEY:
     raise RuntimeError("OPENAI_API_KEY отсутствует")
 
-# OpenAI — берём ключ из env (так стабильнее на Render)
+# OpenAI
 os.environ["OPENAI_API_KEY"] = OPENAI_KEY
 client = OpenAI()
 
-# -------- LOGGING --------
+# ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("fixfur-bot")
 
-# -------- Telegram handlers --------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я бот FIX FUR by ATARSHCHIKOV. Напишите вопрос о мехе, перешиве или уходе — отвечу по делу."
-    )
+# ---------- Aiogram ----------
+bot = Bot(token=TG_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
 
-def ask_openai_sync(text: str) -> str:
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты ассистент бренда «FIX FUR by ATARSHCHIKOV». "
-                    "Тон — премиальный, уверенный, краткий и по делу."
-                ),
-            },
-            {"role": "user", "content": text},
-        ],
-        temperature=0.5,
-        max_tokens=700,
-    )
-    return resp.choices[0].message.content.strip()
+SYSTEM_PROMPT = (
+    "Ты — ассистент бренда «FIX FUR by ATARSHCHIKOV». "
+    "Тон — премиальный, уверенный, без воды. Помогай с перешивом, реставрацией и уходом за мехом."
+)
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text or ""
-    reply = await asyncio.to_thread(ask_openai_sync, user_text)
-    await update.message.reply_text(reply)
+@dp.message(F.text)
+async def on_text(message: Message):
+    user_text = message.text or ""
+    try:
+        resp = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.5,
+                max_tokens=700,
+            )
+        )
+        reply = resp.choices[0].message.content.strip()
+    except Exception as e:
+        reply = f"Сейчас не получается ответить: {e}"
+    await message.answer(reply)
 
-async def run_bot():
-    application = Application.builder().token(TG_TOKEN).build()
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    # run_polling — корутина, НЕ поток. Запускаем её внутри основного event loop:
-    await application.run_polling(close_loop=False)
+async def run_aiogram():
+    await dp.start_polling(bot)
 
-# -------- Flask (healthcheck для Render) --------
-flask_app = Flask(__name__)
+# ---------- Flask (healthcheck для Render) ----------
+app = Flask(__name__)
 
-@flask_app.get("/")
+@app.get("/")
 def health():
     return "ok", 200
 
-# -------- Unified asyncio entrypoint --------
-async def main():
-    # 1) Запускаем бота фоном в этом же event loop
-    asyncio.create_task(run_bot())
-
-    # 2) Поднимаем Flask через Hypercorn (асинхронный WSGI‑сервер)
-    from hypercorn.asyncio import serve
-    from hypercorn.config import Config
+async def run_flask():
     cfg = Config()
     cfg.bind = [f"0.0.0.0:{PORT}"]
-    log.info(f"Starting Flask healthcheck on port {PORT}")
-    await serve(flask_app, cfg)
+    await serve(app, cfg)
+
+# ---------- Unified asyncio entry ----------
+async def main():
+    # запускаем бота и Flask параллельно в одном event loop
+    await asyncio.gather(run_aiogram(), run_flask())
 
 if __name__ == "__main__":
     asyncio.run(main())
