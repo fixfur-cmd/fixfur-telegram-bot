@@ -2,3 +2,4 @@ python-telegram-bot==20.3
 openai>=1.30.0
 python-dotenv
 Flask>=3.0
+hypercorn>=0.15
