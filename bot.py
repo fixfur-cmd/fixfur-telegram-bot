@@ -12,6 +12,7 @@ from aiogram.types import Message
 from flask import Flask
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
+import requests  # для скачивания голосовых
 
 # ---------- ENV ----------
 load_dotenv()
@@ -20,9 +21,12 @@ OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", "10000"))
 
-if not TG_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN отсутствует")
-if not OPENAI_KEY: raise RuntimeError("OPENAI_API_KEY отсутствует")
+if not TG_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN отсутствует")
+if not OPENAI_KEY:
+    raise RuntimeError("OPENAI_API_KEY отсутствует")
 
+# OpenAI
 os.environ["OPENAI_API_KEY"] = OPENAI_KEY
 client = OpenAI()
 
@@ -39,21 +43,18 @@ SYSTEM_PROMPT = (
     "Отвечай кратко, уверенно и по делу. Предлагай решения по перешиву, реставрации, уходу."
 )
 
-# helper: безопасно делим длинные ответы по 3500 символов
 def chunk(text: str, size: int = 3500):
     for i in range(0, len(text), size):
         yield text[i:i+size]
 
-# ---------- /start ----------
 @dp.message(F.text == "/start")
 async def on_start(message: Message):
     welcome = (
         "Добро пожаловать в <b>FIX FUR by ATARSHCHIKOV</b> 🧥\n"
-        "Задайте вопрос о реставрации, перешиве, хранении или уходе за мехом — подскажу лучший вариант."
+        "Задайте вопрос о реставрации, перешиве, хранении или уходе — подскажу лучший вариант."
     )
     await message.answer(welcome)
 
-# ---------- Текст ----------
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message):
     user_text = message.text or ""
@@ -75,8 +76,7 @@ async def on_text(message: Message):
     for part in chunk(reply):
         await message.answer(part)
 
-# ---------- Фото/видео (берём подпись и отвечаем) ----------
-@dp.message(F.photo | F.video | F.document & ~F.document.file_name.endswith(".oga"))
+@dp.message(F.photo | F.video | (F.document & ~F.document.file_name.endswith(".oga")))
 async def on_media(message: Message):
     caption = message.caption or "Прокомментируй это изображение/видео с точки зрения мехового ателье."
     try:
@@ -96,23 +96,23 @@ async def on_media(message: Message):
         reply = f"Получил файл. Пока не удалось обработать: {e}"
     await message.answer(reply)
 
-# ---------- Голосовые: расшифровка Whisper ----------
 @dp.message(F.voice | (F.document & F.document.mime_type == "audio/ogg"))
 async def on_voice(message: Message):
     try:
         file = await bot.get_file(message.voice.file_id if message.voice else message.document.file_id)
         file_url = f"https://api.telegram.org/file/bot{TG_TOKEN}/{file.file_path}"
-        # скачиваем в память
-        import requests, tempfile
+        # скачиваем файл
+        r = requests.get(file_url, timeout=60)
+        r.raise_for_status()
+        import tempfile
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            r = requests.get(file_url, timeout=60)
             tmp.write(r.content)
             tmp_path = tmp.name
-        # отправляем на Whisper
+        # Whisper
         with open(tmp_path, "rb") as f:
             tr = client.audio.transcriptions.create(model="whisper-1", file=f)
-        user_text = tr.text.strip() if hasattr(tr, "text") else tr["text"].strip()
-        # отвечаем как на обычный текст
+        user_text = (tr.text if hasattr(tr, "text") else tr["text"]).strip()
+        # ответ
         resp = await asyncio.to_thread(
             lambda: client.chat.completions.create(
                 model=MODEL,
@@ -129,6 +129,11 @@ async def on_voice(message: Message):
     except Exception as e:
         await message.answer(f"Не удалось обработать голосовое: {e}")
 
+async def run_aiogram():
+    # важный фикс конфликта: сбрасываем вебхук и очищаем висящие апдейты
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
 # ---------- Flask (healthcheck) ----------
 app = Flask(__name__)
 
@@ -140,9 +145,6 @@ async def run_flask():
     cfg = Config()
     cfg.bind = [f"0.0.0.0:{PORT}"]
     await serve(app, cfg)
-
-async def run_aiogram():
-    await dp.start_polling(bot)
 
 # ---------- Entry ----------
 async def main():
