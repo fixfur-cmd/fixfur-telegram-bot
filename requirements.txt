@@ -3,3 +3,4 @@ openai>=1.30.0
 python-dotenv
 Flask>=3.0
 hypercorn>=0.15
+requests>=2.31
