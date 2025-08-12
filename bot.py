@@ -1,57 +1,56 @@
-import os, asyncio
+import os
+import logging
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
-from aiogram.enums import ParseMode
-from aiogram.utils.chat_action import ChatActionSender
 from openai import OpenAI
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
+# Загружаем переменные окружения
 load_dotenv()
+
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-if not TG_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN отсутствует")
-if not OPENAI_KEY: raise RuntimeError("OPENAI_API_KEY отсутствует")
-
-bot = Bot(token=TG_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
+# Настраиваем OpenAI клиента
 client = OpenAI(api_key=OPENAI_KEY)
 
-SYSTEM_PROMPT = (
-    "Ты — ассистент бренда «FIX FUR by ATARSHCHIKOV» (люкс меховое ателье). "
-    "Отвечай кратко, уверенно, по делу; помогай с перешивом, реставрацией, уходом. "
-    "Если нужен офлайн-визит — предложи записаться. Без воды."
+# Логирование
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 
-def ask_openai_sync(text: str) -> str:
+# Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привет! Я бот. Напиши мне что-нибудь, и я отвечу с помощью OpenAI.")
+
+# Обработка сообщений
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_message = update.message.text
+
     try:
-        resp = client.chat.completions.create(
+        response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": text}
-            ],
-            temperature=0.5,
-            max_tokens=700
+                {"role": "system", "content": "Ты дружелюбный помощник."},
+                {"role": "user", "content": user_message}
+            ]
         )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        return "Сейчас не получается ответить из-за тех. ошибки. Попробуйте позже."
+        bot_reply = response.choices[0].message["content"]
+        await update.message.reply_text(bot_reply)
 
-@dp.message(F.text)
-async def on_text(message: Message):
-    async with ChatActionSender.typing(chat_id=message.chat.id, bot=bot):
-        reply = await asyncio.to_thread(ask_openai_sync, message.text)
-    await message.answer(reply)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {str(e)}")
 
-@dp.message()
-async def on_other(message: Message):
-    await message.answer("Пришлите, пожалуйста, текстовый вопрос 🙂")
+# Основная функция
+def main():
+    application = ApplicationBuilder().token(TG_TOKEN).build()
 
-async def main():
-    print("Bot started.")
-    await dp.start_polling(bot)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
