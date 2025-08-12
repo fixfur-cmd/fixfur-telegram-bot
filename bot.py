@@ -1,6 +1,5 @@
 import os
 import asyncio
-import threading
 import logging
 
 from dotenv import load_dotenv
@@ -9,33 +8,34 @@ from openai import OpenAI
 from flask import Flask
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-# ---------- ENV ----------
+# -------- ENV --------
 load_dotenv()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+PORT = int(os.getenv("PORT", "10000"))
 
 if not TG_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN отсутствует")
 if not OPENAI_KEY:
     raise RuntimeError("OPENAI_API_KEY отсутствует")
 
-# OpenAI: передадим ключ через окружение (так надёжнее на Render)
+# OpenAI — берём ключ из env (так стабильнее на Render)
 os.environ["OPENAI_API_KEY"] = OPENAI_KEY
 client = OpenAI()
 
-# ---------- LOGGING ----------
+# -------- LOGGING --------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("fixfur-bot")
 
-# ---------- Telegram handlers ----------
+# -------- Telegram handlers --------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот FIX FUR by ATARSHCHIKOV. Напишите вопрос о мехе, перешиве или уходе — отвечу по делу."
@@ -57,7 +57,6 @@ def ask_openai_sync(text: str) -> str:
         temperature=0.5,
         max_tokens=700,
     )
-    # SDK v1: доступ к контенту так
     return resp.choices[0].message.content.strip()
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -65,31 +64,32 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = await asyncio.to_thread(ask_openai_sync, user_text)
     await update.message.reply_text(reply)
 
-# Асинхронный запуск бота
-async def tg_main():
-    app = ApplicationBuilder().token(TG_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    await app.run_polling()  # блокирующая корутина
+async def run_bot():
+    application = Application.builder().token(TG_TOKEN).build()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # run_polling — корутина, НЕ поток. Запускаем её внутри основного event loop:
+    await application.run_polling(close_loop=False)
 
-def run_tg_in_thread():
-    # Создаём отдельный event loop для потока
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(tg_main())
-
-# ---------- Flask (healthcheck для Render) ----------
+# -------- Flask (healthcheck для Render) --------
 flask_app = Flask(__name__)
 
 @flask_app.get("/")
 def health():
     return "ok", 200
 
-if __name__ == "__main__":
-    # Стартуем Telegram‑бот в отдельном потоке с собственным event loop
-    threading.Thread(target=run_tg_in_thread, daemon=True).start()
+# -------- Unified asyncio entrypoint --------
+async def main():
+    # 1) Запускаем бота фоном в этом же event loop
+    asyncio.create_task(run_bot())
 
-    # Поднимаем веб‑сервер (Render проверяет, что порт открыт)
-    port = int(os.getenv("PORT", "10000"))
-    log.info(f"Starting Flask healthcheck on port {port}")
-    flask_app.run(host="0.0.0.0", port=port)
+    # 2) Поднимаем Flask через Hypercorn (асинхронный WSGI‑сервер)
+    from hypercorn.asyncio import serve
+    from hypercorn.config import Config
+    cfg = Config()
+    cfg.bind = [f"0.0.0.0:{PORT}"]
+    log.info(f"Starting Flask healthcheck on port {PORT}")
+    await serve(flask_app, cfg)
+
+if __name__ == "__main__":
+    asyncio.run(main())
